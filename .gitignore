@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment and sensitive credentials
+.env
+.env.local
+.env.*.local
+
+# Backups and audit reports
+backups/
+logs/
+*.log
+
+# User-generated excel reports (keep the template)
+*.xlsx
+!modelo_olts.xlsx

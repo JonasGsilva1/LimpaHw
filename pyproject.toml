@@ -1,0 +1,20 @@
+[project]
+name = "limpahw"
+version = "0.1.0"
+description = "Automação para limpeza de ONTs offline em OLTs Huawei"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "netmiko>=4.3.0",
+    "paramiko>=3.4.0",
+    "openpyxl>=3.1.0",
+    "pandas>=2.0.0",
+    "pytest>=8.0.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "streamlit>=1.32.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
