@@ -160,6 +160,35 @@ def test_execute_candidate_cleanup_real(tmp_path):
     mock_client.exit_interface_mode.assert_called_once()
 
 
+def test_scan_uses_board_port_count_and_skips_inactive_slot():
+    client = MagicMock()
+
+    def fake_send(cmd):
+        if cmd == "display board 0":
+            return """
+  1       H805GPBD   Normal
+  2       H901GPHF   Failed
+"""
+        return ""
+
+    client.send_command.side_effect = fake_send
+    cleaner = OntCleaner(client, None, CleanupSettings(days_offline_threshold=30))
+
+    cleaner.scan(frame=0)
+    sent = [c.args[0] for c in client.send_command.call_args_list]
+    summaries = [c for c in sent if c.startswith("display ont info summary 0/")]
+    # GPBD = 8 ports, slot 2 inactive -> only 8 port queries in slot 1
+    assert all(c.startswith("display ont info summary 0/1/") for c in summaries)
+    assert len(summaries) == 8
+
+    client.send_command.reset_mock()
+    client.send_command.side_effect = fake_send
+    result = cleaner.scan(frame=0, slot=2)
+    assert result == []
+    sent = [c.args[0] for c in client.send_command.call_args_list]
+    assert not any(c.startswith("display ont info summary") for c in sent)
+
+
 def test_execute_single_rollback(tmp_path):
     bm = BackupManager(str(tmp_path))
     settings = CleanupSettings(dry_run=False)

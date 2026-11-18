@@ -125,6 +125,8 @@ if "scan_errors" not in st.session_state:
     st.session_state.scan_errors = []
 if "rollback_status" not in st.session_state:
     st.session_state.rollback_status = {}
+if "board_reports" not in st.session_state:
+    st.session_state.board_reports = {}
 
 
 def get_template_bytes():
@@ -399,6 +401,7 @@ with tab_scan:
                     candidates = coordinator.scan_all(targets, progress_callback=update_progress)
                     st.session_state.candidates = candidates
                     st.session_state.scan_errors = coordinator.scan_errors
+                    st.session_state.board_reports = coordinator.board_reports
                     progress_bar.progress(100)
                     status_text.text("Varredura concluída!")
 
@@ -420,6 +423,32 @@ with tab_scan:
 
         except Exception as e:
             st.error(f"Erro ao processar a planilha: {e}")
+
+    # Resumo das placas detectadas pelo 'display board 0' na última varredura
+    if st.session_state.get("board_reports"):
+        with st.expander("🧩 Placas detectadas na última varredura (display board)", expanded=False):
+            for olt_label, boards in st.session_state.board_reports.items():
+                pon_boards = [b for b in boards if b.get("is_pon")]
+                st.markdown(f"**{olt_label}**")
+                if not pon_boards:
+                    st.caption("Nenhuma placa PON identificada.")
+                    continue
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Slot": b["slot"],
+                                "Placa": b["board_name"],
+                                "Status": b["status"],
+                                "Portas PON": b["port_count"] or "auto",
+                                "Varrida?": "Sim" if b["is_active"] else "Não (inativa)",
+                            }
+                            for b in pon_boards
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     elif is_demo:
         st.warning("⚠️ Você ativou o Modo Demonstração (OLT Simulada). Você pode clicar abaixo para testar sem planilha real:")
@@ -452,20 +481,78 @@ with tab_review:
         candidates = st.session_state.candidates
         eval_cleaner = OntCleaner(client=None, backup_manager=None, settings=cleanup_settings)
 
-        # Prepare DataFrame for data_editor with ONLY candidates that match the current filter criteria
-        data_rows = []
+        # Elegíveis pelo critério de tempo/whitelist atual
+        eligible_idx = []
         for i, c in enumerate(candidates):
-            ont = c.ont
-            is_elig, reason = eval_cleaner.evaluate_eligibility(ont)
+            is_elig, _ = eval_cleaner.evaluate_eligibility(c.ont)
             c.eligible_for_deletion = is_elig
             if not is_elig:
                 c.selected_by_user = False
-                continue
+            else:
+                eligible_idx.append(i)
 
+        def _olt_label(o):
+            return f"{o.olt_name} ({o.olt_host})" if o.olt_name else (o.olt_host or "-")
+
+        # ---------- Filtros de Revisão ----------
+        with st.expander("🔎 Filtros da Revisão (OLT / Slot / Porta PON / Busca)", expanded=True):
+            f_c1, f_c2, f_c3, f_c4 = st.columns([2, 1, 1, 2])
+            olt_opts = sorted({_olt_label(candidates[i].ont) for i in eligible_idx})
+            with f_c1:
+                sel_olts = st.multiselect("OLT", olt_opts, default=[], placeholder="Todas")
+            base_idx = [i for i in eligible_idx if not sel_olts or _olt_label(candidates[i].ont) in sel_olts]
+
+            slot_opts = sorted({candidates[i].ont.slot for i in base_idx})
+            with f_c2:
+                sel_slots = st.multiselect("Slot / Placa", slot_opts, default=[], placeholder="Todos")
+            base_idx = [i for i in base_idx if not sel_slots or candidates[i].ont.slot in sel_slots]
+
+            port_opts = sorted({candidates[i].ont.port for i in base_idx})
+            with f_c3:
+                sel_ports = st.multiselect("Porta PON", port_opts, default=[], placeholder="Todas")
+            base_idx = [i for i in base_idx if not sel_ports or candidates[i].ont.port in sel_ports]
+
+            with f_c4:
+                search_txt = st.text_input("Buscar Login / SN / MAC", value="", placeholder="ex: joao.silva").strip().lower()
+            if search_txt:
+                base_idx = [
+                    i
+                    for i in base_idx
+                    if search_txt
+                    in " ".join(
+                        [
+                            candidates[i].ont.customer_login or "",
+                            candidates[i].ont.description or "",
+                            candidates[i].ont.sn or "",
+                            candidates[i].ont.mac or "",
+                        ]
+                    ).lower()
+                ]
+
+            b_c1, b_c2, _ = st.columns([1, 1, 3])
+            with b_c1:
+                if st.button("☑️ Marcar todas filtradas", use_container_width=True):
+                    for i in base_idx:
+                        candidates[i].selected_by_user = True
+            with b_c2:
+                if st.button("⬜ Desmarcar todas filtradas", use_container_width=True):
+                    for i in base_idx:
+                        candidates[i].selected_by_user = False
+
+        visible_idx = base_idx
+        filters_active = bool(sel_olts or sel_slots or sel_ports or search_txt)
+
+        # Prepare DataFrame for data_editor with ONLY candidates that match the current filter criteria
+        data_rows = []
+        for i in visible_idx:
+            c = candidates[i]
+            ont = c.ont
             data_rows.append(
                 {
                     "Deletar": c.selected_by_user,
-                    "OLT": f"{ont.olt_name} ({ont.olt_host})" if ont.olt_name else ont.olt_host,
+                    "OLT": _olt_label(ont),
+                    "Slot": ont.slot,
+                    "PON": ont.port,
                     "Local": ont.location,
                     "Login / Descrição (ERP)": ont.customer_login or ont.description or "-",
                     "Serial (SN)": ont.sn or "-",
@@ -479,9 +566,12 @@ with tab_review:
             )
 
         if not data_rows:
-            st.warning(
-                f"Nenhuma ONT da varredura atende ao filtro atual (>= {int(cleanup_settings.days_offline_threshold)} dias offline)."
-            )
+            if eligible_idx and filters_active:
+                st.warning("Nenhuma ONT corresponde aos filtros selecionados. Ajuste ou limpe os filtros acima.")
+            else:
+                st.warning(
+                    f"Nenhuma ONT da varredura atende ao filtro atual (>= {int(cleanup_settings.days_offline_threshold)} dias offline)."
+                )
         else:
             st.markdown(
                 """
@@ -504,6 +594,8 @@ with tab_review:
                 },
                 disabled=[
                     "OLT",
+                    "Slot",
+                    "PON",
                     "Local",
                     "Login / Descrição (ERP)",
                     "Serial (SN)",
@@ -526,12 +618,18 @@ with tab_review:
                 if is_checked:
                     selected_count += 1
 
-            col_m1, col_m2 = st.columns(2)
+            col_m1, col_m2, col_m3 = st.columns(3)
             col_m1.metric(
-                f"Encontradas no Filtro (>= {int(cleanup_settings.days_offline_threshold)} dias)",
-                len(data_rows),
+                f"Elegíveis (>= {int(cleanup_settings.days_offline_threshold)} dias)",
+                len(eligible_idx),
             )
-            col_m2.metric("Confirmadas p/ Exclusão", selected_count)
+            col_m2.metric("Exibidas pelos Filtros", len(data_rows))
+            col_m3.metric("Confirmadas p/ Exclusão", selected_count)
+            if filters_active:
+                st.caption("ℹ️ Somente as ONTs exibidas pelos filtros acima serão processadas na limpeza.")
+
+            # Apenas candidatos visíveis (filtrados) e marcados entram na execução
+            exec_candidates = [candidates[i] for i in visible_idx]
 
             st.divider()
 
@@ -570,7 +668,7 @@ with tab_review:
 
                     results = coordinator.execute_cleanups(
                         targets_by_ip=targets_by_ip,
-                        candidates=candidates,
+                        candidates=exec_candidates,
                         progress_callback=update_exec,
                     )
                     st.session_state.results = results
@@ -585,7 +683,7 @@ with tab_review:
                     st.session_state.excel_report_path = excel_report_file
 
                     session_rollback = backup_mgr.save_session_rollback(
-                        [c for c in candidates if c.selected_by_user and c.eligible_for_deletion]
+                        [c for c in exec_candidates if c.selected_by_user and c.eligible_for_deletion]
                     )
                     st.session_state.session_rollback_path = session_rollback
 

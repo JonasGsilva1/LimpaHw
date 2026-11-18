@@ -8,6 +8,9 @@ from app.olt_connection import HuaweiOltClient
 from app.mock_client import MockOltClient
 from app.parsers import (
     parse_board_slots,
+    parse_board_info,
+    parse_board_ports,
+    DEFAULT_PON_PORTS,
     parse_ont_summary,
     parse_ont_detail,
     parse_service_ports_from_config,
@@ -31,6 +34,7 @@ class OntCleaner:
         self.settings = settings
         self.olt_host = olt_host
         self.olt_name = olt_name
+        self.detected_boards: List[dict] = []
 
     def evaluate_eligibility(self, ont: OntRecord) -> Tuple[bool, str]:
         """
@@ -184,37 +188,76 @@ class OntCleaner:
     ) -> List[CleanupCandidate]:
         """
         Scans OLT ports based on parameters.
-        - If slot and port provided: scans only that port.
-        - If slot provided, port=None: scans all 16 ports of the slot.
-        - If slot=None: queries active GPON boards with 'display board 0' and scans all.
+        Always starts with 'display board 0' to discover active PON boards and their port count,
+        avoiding commands on empty slots, inactive boards and non-existent ports.
+        - If slot and port provided: scans only that port (if the board is active).
+        - If slot provided, port=None: scans all ports of that board.
+        - If slot=None: scans all active PON boards.
+        If the board table cannot be parsed, falls back to the previous behavior (16 ports).
         """
         all_candidates: List[CleanupCandidate] = []
+        self.detected_boards = []
 
-        if slot is not None and port is not None:
-            return self.scan_port(frame, slot, port, reference_time, progress_callback)
+        # 1. Discover boards first
+        if progress_callback:
+            progress_callback(f"Consultando placas ativas (display board {frame}) em {self.olt_name or self.olt_host}...")
+        board_output = self.client.send_command(f"display board {frame}")
+        boards = parse_board_info(board_output)
+        active_pon = {b["slot"]: b for b in boards if b["is_pon"] and b["is_active"]}
+        self.detected_boards = boards
 
-        slots_to_scan: List[int] = []
+        if boards:
+            resumo = ", ".join(
+                f"slot {b['slot']}={b['board_name']}({b['status']})" for b in boards if b["is_pon"]
+            )
+            logger.info(f"Placas PON em {self.olt_host}: {resumo or 'nenhuma'}")
+        else:
+            logger.warning(
+                f"Não foi possível interpretar 'display board {frame}' na OLT {self.olt_host}. "
+                f"Saída:\n{board_output[:600]}"
+            )
+
+        # 2. Decide which slots to scan
         if slot is not None:
+            if active_pon and slot not in active_pon:
+                msg = f"Slot {slot} não possui placa PON ativa na OLT {self.olt_name or self.olt_host}. Ignorado."
+                logger.warning(msg)
+                if progress_callback:
+                    progress_callback(msg)
+                return all_candidates
             slots_to_scan = [slot]
         else:
-            if progress_callback:
-                progress_callback(f"Consultando placas GPON ativas em {self.olt_name or self.olt_host}...")
-            board_output = self.client.send_command(f"display board {frame}")
-            slots_to_scan = parse_board_slots(board_output)
-            logger.info(f"Slots GPON detectados em {self.olt_host}: {slots_to_scan}")
+            slots_to_scan = sorted(active_pon.keys())
             if not slots_to_scan:
-                logger.warning(
-                    f"Nenhum slot GPON detectado na OLT {self.olt_host}. "
-                    f"Saída de 'display board {frame}':\n{board_output[:600]}"
-                )
+                logger.warning(f"Nenhum slot GPON ativo detectado na OLT {self.olt_host}.")
 
+        # 3. Scan only the existing ports of each board
         for s in slots_to_scan:
-            ports_to_scan = [port] if port is not None else list(range(0, 16))
+            if port is not None:
+                ports_to_scan = [port]
+            else:
+                ports_to_scan = self._get_ports_for_slot(frame, s, active_pon.get(s))
+            logger.info(f"OLT {self.olt_host} slot {s}: varrendo portas {ports_to_scan}")
             for p in ports_to_scan:
                 cands = self.scan_port(frame, s, p, reference_time, progress_callback)
                 all_candidates.extend(cands)
 
         return all_candidates
+
+    def _get_ports_for_slot(self, frame: int, slot: int, board: Optional[dict]) -> List[int]:
+        """Returns the PON port list of a board using the known model table or 'display board 0/{slot}'."""
+        if board and board.get("port_count"):
+            return list(range(board["port_count"]))
+
+        try:
+            detail = self.client.send_command(f"display board {frame}/{slot}")
+            ports = parse_board_ports(detail)
+            if ports:
+                return ports
+        except Exception as e:
+            logger.debug(f"Falha ao consultar display board {frame}/{slot}: {e}")
+
+        return list(range(DEFAULT_PON_PORTS))
 
     def execute_candidate_cleanup(self, candidate: CleanupCandidate) -> CleanupResult:
         """
@@ -360,6 +403,7 @@ class MultiOltCoordinator:
         self.jumpserver_password = jumpserver_password
         self.jumpserver_account = jumpserver_account
         self.scan_errors: List[str] = []
+        self.board_reports: dict = {}
 
     def _create_client(self, target: OltTarget):
         if self.is_demo:
@@ -419,6 +463,7 @@ class MultiOltCoordinator:
                     progress_callback=progress_callback,
                 )
                 all_candidates.extend(candidates)
+                self.board_reports[target.display_name] = cleaner.detected_boards
             except Exception as e:
                 err_msg = f"Erro ao escanear OLT {target.display_name}: {e}"
                 logger.error(err_msg)

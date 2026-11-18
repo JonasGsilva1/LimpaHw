@@ -4,30 +4,92 @@ from typing import List, Optional, Dict
 from app.models import OntRecord, ServicePortRecord
 
 
+BOARD_CONTROL_KEYWORDS = ("SCU", "MPL", "PIS", "PRT", "GIC", "X2C", "CIL", "CIU", "EMU", "MPW", "PWR", "FAN")
+BOARD_PON_KEYWORDS = ("GP", "XG", "CG", "PON", "EP", "TW")
+
+# Quantidade de portas PON por modelo de placa Huawei (busca por trecho do nome, ex: H901GPHF -> GPHF)
+BOARD_PORT_COUNT = {
+    "GPBD": 8,
+    "GPBH": 8,
+    "GPBC": 4,
+    "EPBD": 8,
+    "XGBD": 8,
+    "XGHD": 8,
+    "XEHD": 8,
+    "TWED": 8,
+    "GPFD": 16,
+    "GPHF": 16,
+    "GPLF": 16,
+    "GPSF": 16,
+    "GPUF": 16,
+    "GPFF": 16,
+    "CGHF": 16,
+    "EPFD": 16,
+}
+DEFAULT_PON_PORTS = 16
+
+
+def get_board_port_count(board_name: str) -> Optional[int]:
+    """Returns the known PON port count for a Huawei board name, or None if unknown."""
+    name = (board_name or "").upper()
+    for model, count in BOARD_PORT_COUNT.items():
+        if model in name:
+            return count
+    return None
+
+
+def parse_board_info(output: str) -> List[Dict]:
+    """
+    Parses `display board 0` returning every board found:
+    [{'slot': 1, 'board_name': 'H901GPHF', 'status': 'normal', 'is_pon': True,
+      'is_active': True, 'port_count': 16}, ...]
+    """
+    boards: List[Dict] = []
+    for line in output.splitlines():
+        match = re.search(r"^\s*(\d+)\s+([A-Za-z0-9_-]+)\s+([A-Za-z0-9_-]+)", line)
+        if not match:
+            continue
+        slot_id = int(match.group(1))
+        board_name = match.group(2).upper()
+        status = match.group(3).lower()
+
+        is_control = any(ctrl in board_name for ctrl in BOARD_CONTROL_KEYWORDS)
+        is_pon = (not is_control) and any(x in board_name for x in BOARD_PON_KEYWORDS)
+        is_active = "normal" in status or "active" in status
+
+        boards.append(
+            {
+                "slot": slot_id,
+                "board_name": board_name,
+                "status": status,
+                "is_pon": is_pon,
+                "is_active": is_active,
+                "port_count": get_board_port_count(board_name) if is_pon else None,
+            }
+        )
+    return boards
+
+
+def parse_board_ports(output: str) -> List[int]:
+    """
+    Parses `display board 0/{slot}` (GPON board detail) returning the PON port numbers listed
+    in the port table, e.g. lines like '   0  GPON   0   20   Online'.
+    """
+    ports = set()
+    port_re = re.compile(r"^\s*(\d+)\s+(?:GPON|XG-?PON\S*|XGS-?PON\S*|EPON|10G-?\S*|COMBO\S*)\b", re.IGNORECASE)
+    for line in output.splitlines():
+        m = port_re.match(line)
+        if m:
+            ports.add(int(m.group(1)))
+    return sorted(ports)
+
+
 def parse_board_slots(output: str) -> List[int]:
     """
     Parses `display board 0` to find slots with active GPON/EPON/XGPON/Combo-PON boards.
     Looks for boards like GPBD, GPFD, GPHF, GPLF, CGHF, XGHD, etc.
     """
-    gpon_slots: List[int] = []
-    control_keywords = ("SCU", "MPL", "PIS", "PRT", "GIC", "X2C", "CIL", "CIU", "EMU", "MPW", "PWR", "FAN")
-    pon_keywords = ("GP", "XG", "CG", "PON", "EP", "TW")
-
-    lines = output.splitlines()
-    for line in lines:
-        match = re.search(r"^\s*(\d+)\s+([A-Za-z0-9_-]+)\s+([A-Za-z0-9_-]+)", line)
-        if match:
-            slot_id = int(match.group(1))
-            board_name = match.group(2).upper()
-            status = match.group(3).lower()
-
-            if any(ctrl in board_name for ctrl in control_keywords):
-                continue
-
-            if "normal" in status or "active" in status:
-                if any(x in board_name for x in pon_keywords):
-                    gpon_slots.append(slot_id)
-    return gpon_slots
+    return [b["slot"] for b in parse_board_info(output) if b["is_pon"] and b["is_active"]]
 
 
 def parse_ont_summary(

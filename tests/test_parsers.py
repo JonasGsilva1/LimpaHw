@@ -113,6 +113,50 @@ def test_parse_board_slots():
     assert slots == [1, 2]
 
 
+def test_parse_board_info_port_count():
+    from app.parsers import parse_board_info
+
+    boards = parse_board_info(SAMPLE_BOARD_OUTPUT)
+    pon = {b["slot"]: b for b in boards if b["is_pon"]}
+    assert set(pon.keys()) == {1, 2}
+    assert pon[1]["board_name"] == "H901GPHF"
+    assert pon[1]["port_count"] == 16
+    assert pon[1]["is_active"]
+
+
+def test_parse_board_info_inactive_and_8_ports():
+    from app.parsers import parse_board_info, parse_board_slots
+
+    output = """
+  SlotID  BoardName  Status
+  -------------------------
+  1       H805GPBD   Normal
+  2       H901GPHF   Failed
+  3
+  9       H901MPLA   Active_normal
+"""
+    boards = {b["slot"]: b for b in parse_board_info(output) if b["is_pon"]}
+    assert boards[1]["port_count"] == 8
+    assert not boards[2]["is_active"]
+    assert parse_board_slots(output) == [1]
+
+
+def test_parse_board_ports_detail():
+    from app.parsers import parse_board_ports
+
+    detail = """
+  ------------------------------------------------------------------------
+  Port  Port Type  Min Distance(km)  Max Distance(km)  Optical Module Status
+  ------------------------------------------------------------------------
+     0  GPON       0                 20                Online
+     1  GPON       0                 20                Offline
+     2  GPON       0                 20                Online
+     3  GPON       0                 20                Online
+  ------------------------------------------------------------------------
+"""
+    assert parse_board_ports(detail) == [0, 1, 2, 3]
+
+
 def test_parse_ont_summary():
     onts = parse_ont_summary(SAMPLE_ONT_SUMMARY, frame=0, slot=1, port=0)
     assert len(onts) == 4
