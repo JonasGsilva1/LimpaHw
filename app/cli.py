@@ -454,6 +454,7 @@ def run_cli():
     export_cleanup_report_excel(results, excel_report)
 
     session_rollback = backup_mgr.save_session_rollback(confirmed_candidates)
+    history_txt = backup_mgr.save_deletion_history_txt(results, is_dry_run=cleanup_settings.dry_run)
     audit_json = backup_mgr.save_audit_report(results)
 
     # Final Summary Panel
@@ -464,6 +465,7 @@ def run_cli():
     [bold green]Concluído com sucesso:[/bold green] {success_count} ONTs
     [bold red]Falhas:[/bold red] {failed_count}
     [bold]Relatório em Excel:[/bold] [cyan]{excel_report}[/cyan]
+    [bold]Histórico de Exclusões (.txt):[/bold] [cyan]{history_txt or 'N/A'}[/cyan]
     [bold]Script de Rollback da Sessão:[/bold] [cyan]{session_rollback or 'N/A'}[/cyan]
     [bold]Relatório JSON:[/bold] [cyan]{audit_json}[/cyan]
     """

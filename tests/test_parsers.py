@@ -250,3 +250,34 @@ def test_parse_ont_summary_two_tables_with_tz():
     assert onts[2].calculated_offline_days is None
 
 
+def test_parse_jumpserver_assets_table_and_pagination():
+    from app.jumpserver_client import parse_jumpserver_assets_table, _parse_jumpserver_page_info
+
+    pipe_output = """
+  ID | NAME           | ADDRESS     | PLATFORM | COMMENT
+-----+----------------+-------------+----------+--------------
+   1 | OLT-HW-CENTRO  | 10.10.0.1   | Huawei   | MA5800-X7
+   2 | OLT-HW-NORTE   | 10.10.0.2   | Huawei   | MA5608T
+Page: 1, Count: 2, Total Page: 3, Total Count: 6
+[Host]>
+"""
+    assets = parse_jumpserver_assets_table(pipe_output)
+    assert len(assets) == 2
+    assert assets[0]["name"] == "OLT-HW-CENTRO"
+    assert assets[0]["address"] == "10.10.0.1"
+    assert assets[1]["name"] == "OLT-HW-NORTE"
+    assert assets[1]["address"] == "10.10.0.2"
+    assert _parse_jumpserver_page_info(pipe_output) == (1, 3)
+
+    ws_output = """
+  ID   Hostname        IP          Comment
+  1    OLT-POP-SUL     10.20.0.5   GPON
+  2    OLT-POP-LESTE   10.20.0.6   Combo
+"""
+    ws_assets = parse_jumpserver_assets_table(ws_output)
+    assert len(ws_assets) == 2
+    assert ws_assets[0]["name"] == "OLT-POP-SUL"
+    assert ws_assets[0]["address"] == "10.20.0.5"
+
+
+

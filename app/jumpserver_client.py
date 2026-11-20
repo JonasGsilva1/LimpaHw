@@ -1,7 +1,7 @@
 import time
 import re
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 import paramiko
 
 logger = logging.getLogger("limpahw.jumpserver")
@@ -19,6 +19,86 @@ def strip_ansi(text: str) -> str:
         clean = BACKSPACE_REGEX.sub("", clean)
     clean = clean.replace("\r\r\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
     return clean
+
+
+def parse_jumpserver_assets_table(output: str) -> List[Dict[str, str]]:
+    """
+    Parses the asset table returned by JumpServer Koko (e.g. after sending 'p' at [Host]>).
+    Supports pipe-delimited tables ('ID | Name | Address | Platform | Comment')
+    as well as whitespace-aligned tables ('ID  Hostname  IP  Comment').
+    """
+    assets: List[Dict[str, str]] = []
+    seen = set()
+
+    # Pipe-delimited format: "  1 | OLT-HW-01 | 10.10.0.1 | Linux | comment"
+    pipe_re = re.compile(r"^\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)(?:\s*\|\s*([^|]*))?(?:\s*\|\s*(.*))?$")
+    # Whitespace-aligned format: "  1   OLT-HW-01   10.10.0.1   optional comment"
+    ws_re = re.compile(r"^\s*(\d+)\s+(\S+)\s+(\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9._:-]+)(?:\s+(.*))?$")
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("-") or line.startswith("+") or line.startswith("="):
+            continue
+        low = line.lower()
+        if low.startswith("id ") or low.startswith("id|") or low.startswith("page:") or "[host]>" in low or "opt>" in low:
+            continue
+
+        m_pipe = pipe_re.match(raw_line)
+        if m_pipe:
+            name = m_pipe.group(2).strip()
+            address = m_pipe.group(3).strip()
+            col4 = (m_pipe.group(4) or "").strip()
+            col5 = (m_pipe.group(5) or "").strip()
+            if name.lower() in ("name", "hostname", "asset", "nome"):
+                continue
+            key = (name, address)
+            if key not in seen and (name or address):
+                seen.add(key)
+                assets.append(
+                    {
+                        "name": name,
+                        "address": address,
+                        "platform": col4 if col5 else "",
+                        "comment": col5 if col5 else col4,
+                    }
+                )
+            continue
+
+        m_ws = ws_re.match(raw_line)
+        if m_ws:
+            name = m_ws.group(2).strip()
+            address = m_ws.group(3).strip()
+            comment = (m_ws.group(4) or "").strip()
+            if name.lower() in ("name", "hostname", "asset", "nome"):
+                continue
+            key = (name, address)
+            if key not in seen and (name or address):
+                seen.add(key)
+                assets.append(
+                    {
+                        "name": name,
+                        "address": address,
+                        "platform": "",
+                        "comment": comment,
+                    }
+                )
+
+    return assets
+
+
+def _parse_jumpserver_page_info(output: str) -> Tuple[int, int]:
+    """
+    Extracts (current_page, total_pages) from JumpServer Koko footer like:
+    'Page: 1, Count: 15, Total Page: 3, Total Count: 42'
+    Returns (1, 1) if no pagination footer is detected.
+    """
+    m = re.search(r"Page\s*:\s*(\d+).*?Total\s*Page\s*:\s*(\d+)", output, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m_pt = re.search(r"P[aá]gina\s*:\s*(\d+).*?Total\s*(?:de\s*)?P[aá]ginas?\s*:\s*(\d+)", output, re.IGNORECASE)
+    if m_pt:
+        return int(m_pt.group(1)), int(m_pt.group(2))
+    return 1, 1
 
 
 class JumpServerOltClient:
@@ -469,3 +549,75 @@ class JumpServerOltClient:
         self.channel = None
         self.ssh = None
         logger.info("[JumpServer] Sessão encerrada.")
+
+    def list_assets(self, search_filter: str = "", max_pages: int = 30) -> List[Dict[str, str]]:
+        """
+        Connects to JumpServer Koko, lists all assets available to the user
+        (traversing pagination automatically), and returns a list of dicts:
+        [{'name': ..., 'address': ..., 'platform': ..., 'comment': ...}, ...]
+        """
+        logger.info(
+            f"[JumpServer] Buscando lista de ativos em {self.jumpserver_host}:{self.jumpserver_port} (usuário: '{self.username}')..."
+        )
+        self.ssh = paramiko.SSHClient()
+        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        try:
+            self.ssh.connect(
+                hostname=self.jumpserver_host,
+                port=self.jumpserver_port,
+                username=self.username,
+                password=self.password,
+                timeout=self.timeout,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            self.channel = self.ssh.invoke_shell(term="vt100", width=250, height=100)
+            self.channel.settimeout(float(self.timeout))
+
+            self._read_until(["[Host]>", "Host>", "Opt>"], timeout=12)
+
+            # Send 'p' to print all assets (or '/<filter>' if a filter was requested)
+            cmd = f"/{search_filter.strip()}" if search_filter.strip() else "p"
+            self.channel.send(f"{cmd}\n")
+            time.sleep(1.0)
+            page_output = self._read_until(["[Host]>", "Host>", "Opt>"], timeout=12)
+            logger.debug(f"[JumpServer] Página 1 de ativos:\n{page_output[-600:]}")
+
+            all_assets: List[Dict[str, str]] = []
+            seen = set()
+
+            def _collect(text: str) -> None:
+                for item in parse_jumpserver_assets_table(text):
+                    key = (item["name"], item["address"])
+                    if key not in seen:
+                        seen.add(key)
+                        all_assets.append(item)
+
+            _collect(page_output)
+            curr_page, total_pages = _parse_jumpserver_page_info(page_output)
+            logger.info(
+                f"[JumpServer] Página {curr_page}/{total_pages} carregada ({len(all_assets)} ativo(s) até agora)."
+            )
+
+            pages_read = 1
+            while curr_page < total_pages and pages_read < max_pages:
+                self.channel.send("n\n")
+                time.sleep(0.8)
+                next_output = self._read_until(["[Host]>", "Host>", "Opt>"], timeout=12)
+                _collect(next_output)
+                new_curr, total_pages = _parse_jumpserver_page_info(next_output)
+                pages_read += 1
+                if new_curr <= curr_page:
+                    break
+                curr_page = new_curr
+                logger.info(
+                    f"[JumpServer] Página {curr_page}/{total_pages} carregada ({len(all_assets)} ativo(s) no total)."
+                )
+
+            return all_assets
+        except Exception as e:
+            logger.error(f"[JumpServer] Erro ao listar ativos: {e}")
+            raise ConnectionError(f"Erro ao listar ativos do JumpServer ({self.jumpserver_host}): {e}")
+        finally:
+            self.disconnect()

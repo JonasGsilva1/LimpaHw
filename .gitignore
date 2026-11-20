@@ -18,6 +18,7 @@ venv/
 
 # Backups and audit reports
 backups/
+historico_exclusoes/
 logs/
 *.log
 

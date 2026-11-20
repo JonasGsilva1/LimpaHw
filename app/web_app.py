@@ -9,6 +9,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 LOG_FILE_PATH = ROOT_DIR / "logs" / "limpa_hw.log"
+HISTORY_DIR_PATH = ROOT_DIR / "historico_exclusoes"
 
 
 def configure_web_logging() -> None:
@@ -127,6 +128,12 @@ if "rollback_status" not in st.session_state:
     st.session_state.rollback_status = {}
 if "board_reports" not in st.session_state:
     st.session_state.board_reports = {}
+if "js_assets" not in st.session_state:
+    st.session_state.js_assets = []
+if "history_txt_path" not in st.session_state:
+    st.session_state.history_txt_path = None
+if "last_cleanup_summary" not in st.session_state:
+    st.session_state.last_cleanup_summary = None
 
 
 def get_template_bytes():
@@ -323,106 +330,262 @@ tab_scan, tab_review, tab_results, tab_logs = st.tabs(
 
 # ---------------- TAB 1: Importar & Varrer ----------------
 with tab_scan:
-    st.subheader("Importação da Planilha de OLTs")
+    def _execute_scan_workflow(scan_targets: list) -> None:
+        if use_jumpserver and not is_demo and (not js_host or not js_user or not js_pass):
+            st.error("⚠️ Informe o Host, Usuário e Senha do JumpServer na barra lateral esquerda antes de iniciar a varredura.")
+            return
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        uploaded_file = st.file_uploader(
-            "Selecione a planilha Excel com as OLTs (.xlsx)",
-            type=["xlsx"],
-            help="A planilha deve conter as colunas: IP_OLT, Usuario, Senha (e opcionais: Nome_OLT, Porta_SSH, Slot, Porta_PON).",
+        backup_mgr = BackupManager(cleanup_settings.backup_dir, history_dir=str(HISTORY_DIR_PATH))
+        coordinator = MultiOltCoordinator(
+            backup_manager=backup_mgr,
+            settings=cleanup_settings,
+            is_demo=is_demo,
+            use_jumpserver=use_jumpserver,
+            jumpserver_host=js_host,
+            jumpserver_port=int(js_port),
+            jumpserver_user=js_user,
+            jumpserver_password=js_pass,
+            jumpserver_account=js_account,
         )
-    with c2:
-        st.write("**Planilha Modelo:**")
-        st.download_button(
-            label="📥 Baixar Planilha Modelo (.xlsx)",
-            data=get_template_bytes(),
-            file_name="modelo_olts.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
 
-    if uploaded_file:
-        try:
-            targets = read_olts_from_excel(uploaded_file)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-            # Preenche credenciais padrão se estiver em SSH Direto e campos vazios
-            if not use_jumpserver and not is_demo:
-                for t in targets:
-                    if not t.username and direct_user:
-                        t.username = direct_user
-                    if not t.password and direct_pass:
-                        t.password = direct_pass
-                    if (not t.port or t.port == 22) and direct_port:
-                        t.port = int(direct_port)
+        def update_progress(msg: str):
+            status_text.text(msg)
 
-            st.session_state.targets = targets
-            st.success(f"Planilha carregada com sucesso! **{len(targets)} OLT(s)** identificada(s).")
+        candidates = coordinator.scan_all(scan_targets, progress_callback=update_progress)
+        st.session_state.targets = scan_targets
+        st.session_state.candidates = candidates
+        st.session_state.scan_errors = coordinator.scan_errors
+        st.session_state.board_reports = coordinator.board_reports
+        st.session_state.last_cleanup_summary = None
+        progress_bar.progress(100)
+        status_text.text("Varredura concluída!")
 
-            # Show targets table
-            target_df = pd.DataFrame(
-                [
-                    {
-                        "Nome": t.name or "-",
-                        "IP OLT": t.host,
-                        "Porta": t.port,
-                        "Usuário": t.username,
-                        "Slot Filtrado": t.slot if t.slot is not None else "Todos",
-                        "Porta PON Filtrada": t.port_gpon if t.port_gpon is not None else "Todas",
-                    }
-                    for t in targets
-                ]
+        if coordinator.scan_errors:
+            for err in coordinator.scan_errors:
+                st.error(f"❌ {err}")
+            st.warning(
+                "💡 Consulte a aba **'4. Logs de Diagnóstico'** (ou o arquivo `logs/limpa_hw.log`) para ver o retorno detalhado do JumpServer/OLT."
             )
-            st.dataframe(target_df, use_container_width=True, hide_index=True)
 
-            if st.button("🚀 Iniciar Varredura de ONTs Offline", type="primary", use_container_width=True):
-                if use_jumpserver and not is_demo and (not js_host or not js_user or not js_pass):
-                    st.error("⚠️ Informe o Host, Usuário e Senha do JumpServer na barra lateral esquerda antes de iniciar a varredura.")
+        if candidates:
+            st.success(f"Varredura finalizada! **{len(candidates)} ONTs offline** encontradas.")
+            st.info("Acesse a aba **'2. Revisar Clientes & Confirmar'** para verificar os logins e aprovar as deleções.")
+        elif not coordinator.scan_errors:
+            st.warning(
+                "⚠️ A varredura terminou sem erros de conexão, mas **0 ONTs offline** atenderam aos critérios informados. "
+                "Verifique a aba **'4. Logs de Diagnóstico'** para conferir os comandos executados na OLT."
+            )
+
+    if is_demo:
+        st.warning("⚠️ Você ativou o Modo Demonstração (OLT Simulada). Você pode clicar abaixo para testar sem planilha real:")
+        if st.button("🧪 Executar Varredura com OLT de Teste", type="primary"):
+            mock_target = OltTarget(
+                host="192.168.1.100",
+                port=22,
+                username="admin",
+                password="mock",
+                name="OLT Central (Simulada)",
+                slot=1,
+                port_gpon=0,
+            )
+            _execute_scan_workflow([mock_target])
+    else:
+        source_mode = "📊 Importar Planilha Excel (.xlsx)"
+        if use_jumpserver:
+            source_mode = st.radio(
+                "Como deseja selecionar as OLTs?",
+                [
+                    "🔍 Buscar direto do JumpServer (sem planilha)",
+                    "📊 Importar Planilha Excel (.xlsx)",
+                ],
+                horizontal=True,
+            )
+
+        if use_jumpserver and source_mode.startswith("🔍"):
+            st.subheader("Seleção de OLTs direto do JumpServer")
+
+            j_col1, j_col2 = st.columns([2, 1])
+            with j_col1:
+                js_query_hint = st.text_input(
+                    "Filtro inicial na busca do JumpServer (opcional)",
+                    value="",
+                    placeholder="Deixe vazio para puxar todos os ativos ou digite ex: OLT",
+                )
+            with j_col2:
+                st.write("")
+                st.write("")
+                load_js_btn = st.button("🔄 Carregar OLTs do JumpServer", type="primary", use_container_width=True)
+
+            if load_js_btn:
+                if not js_host or not js_user or not js_pass:
+                    st.error("⚠️ Informe o Host, Usuário e Senha do JumpServer na barra lateral esquerda.")
                 else:
-                    backup_mgr = BackupManager(cleanup_settings.backup_dir)
-                    coordinator = MultiOltCoordinator(
-                        backup_manager=backup_mgr,
-                        settings=cleanup_settings,
-                        is_demo=is_demo,
-                        use_jumpserver=use_jumpserver,
-                        jumpserver_host=js_host,
-                        jumpserver_port=int(js_port),
-                        jumpserver_user=js_user,
-                        jumpserver_password=js_pass,
-                        jumpserver_account=js_account,
+                    from app.jumpserver_client import JumpServerOltClient
+
+                    with st.spinner(f"Conectando ao JumpServer ({js_host}) e listando equipamentos disponíveis..."):
+                        try:
+                            js_client = JumpServerOltClient(
+                                jumpserver_host=js_host,
+                                jumpserver_port=int(js_port),
+                                username=js_user,
+                                password=js_pass,
+                                system_user=js_account,
+                                timeout=30,
+                            )
+                            assets = js_client.list_assets(search_filter=js_query_hint)
+                            st.session_state.js_assets = assets
+                            if assets:
+                                st.success(f"✅ **{len(assets)} equipamento(s)** carregado(s) do JumpServer!")
+                            else:
+                                st.warning(
+                                    "⚠️ Nenhum ativo foi identificado na resposta do JumpServer. "
+                                    "Consulte a aba **'4. Logs de Diagnóstico'** para verificar o retorno do comando."
+                                )
+                        except Exception as e:
+                            st.error(f"❌ Erro ao carregar OLTs do JumpServer: {e}")
+
+            if st.session_state.js_assets:
+                flt_c1, flt_c2 = st.columns([2, 1])
+                with flt_c1:
+                    local_asset_filter = st.text_input(
+                        "Filtrar lista carregada (Nome / IP / Comentário)",
+                        value="",
+                        placeholder="ex: OLT, 10.10., CENTRO...",
+                    ).strip().lower()
+                with flt_c2:
+                    st.write("")
+                    st.write("")
+                    only_olt_name = st.checkbox("Apenas com 'OLT' no nome", value=False)
+
+                filtered_assets = []
+                for a in st.session_state.js_assets:
+                    haystack = f"{a.get('name', '')} {a.get('address', '')} {a.get('comment', '')}".lower()
+                    if only_olt_name and "olt" not in (a.get("name", "") + " " + a.get("comment", "")).lower():
+                        continue
+                    if local_asset_filter and local_asset_filter not in haystack:
+                        continue
+                    filtered_assets.append(a)
+
+                asset_labels = [
+                    f"{a['name']} ({a['address']})" if a.get("name") and a.get("address") else (a.get("name") or a.get("address"))
+                    for a in filtered_assets
+                ]
+                label_to_asset = dict(zip(asset_labels, filtered_assets))
+
+                selected_labels = st.multiselect(
+                    f"Selecione a(s) OLT(s) para varredura ({len(filtered_assets)} disponíveis)",
+                    options=asset_labels,
+                    placeholder="Escolha uma ou mais OLTs...",
+                )
+
+                scope_mode = st.radio(
+                    "Escopo da Varredura",
+                    [
+                        "🌐 Varredura Geral (todas as placas PON ativas)",
+                        "🧩 Somente uma Placa / Slot específico",
+                        "🔌 Somente uma Porta PON específica",
+                    ],
+                    horizontal=True,
+                )
+
+                chosen_slot = None
+                chosen_pon = None
+                if scope_mode.startswith("🧩"):
+                    chosen_slot = int(st.number_input("Número do Slot / Placa", min_value=0, max_value=32, value=1, step=1))
+                elif scope_mode.startswith("🔌"):
+                    sc_c1, sc_c2 = st.columns([1, 1])
+                    with sc_c1:
+                        chosen_slot = int(st.number_input("Número do Slot / Placa", min_value=0, max_value=32, value=1, step=1))
+                    with sc_c2:
+                        chosen_pon = int(st.number_input("Número da Porta PON", min_value=0, max_value=15, value=0, step=1))
+
+                if selected_labels:
+                    js_targets = []
+                    for lbl in selected_labels:
+                        asset = label_to_asset[lbl]
+                        js_targets.append(
+                            OltTarget(
+                                host=asset.get("address") or asset.get("name"),
+                                port=22,
+                                username="",
+                                password="",
+                                name=asset.get("name") or asset.get("address"),
+                                slot=chosen_slot,
+                                port_gpon=chosen_pon,
+                            )
+                        )
+
+                    if st.button(
+                        f"🚀 Iniciar Varredura ({len(js_targets)} OLT(s) selecionada(s))",
+                        type="primary",
+                        use_container_width=True,
+                        key="btn_scan_js_direct",
+                    ):
+                        _execute_scan_workflow(js_targets)
+            else:
+                st.info("Clique em **'🔄 Carregar OLTs do JumpServer'** acima para listar os equipamentos disponíveis sem precisar de planilha.")
+
+        else:
+            st.subheader("Importação da Planilha de OLTs")
+
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                uploaded_file = st.file_uploader(
+                    "Selecione a planilha Excel com as OLTs (.xlsx)",
+                    type=["xlsx"],
+                    help="A planilha deve conter as colunas: IP_OLT, Usuario, Senha (e opcionais: Nome_OLT, Porta_SSH, Slot, Porta_PON).",
+                )
+            with c2:
+                st.write("**Planilha Modelo:**")
+                st.download_button(
+                    label="📥 Baixar Planilha Modelo (.xlsx)",
+                    data=get_template_bytes(),
+                    file_name="modelo_olts.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+            if uploaded_file:
+                try:
+                    targets = read_olts_from_excel(uploaded_file)
+
+                    # Preenche credenciais padrão se estiver em SSH Direto e campos vazios
+                    if not use_jumpserver and not is_demo:
+                        for t in targets:
+                            if not t.username and direct_user:
+                                t.username = direct_user
+                            if not t.password and direct_pass:
+                                t.password = direct_pass
+                            if (not t.port or t.port == 22) and direct_port:
+                                t.port = int(direct_port)
+
+                    st.session_state.targets = targets
+                    st.success(f"Planilha carregada com sucesso! **{len(targets)} OLT(s)** identificada(s).")
+
+                    # Show targets table
+                    target_df = pd.DataFrame(
+                        [
+                            {
+                                "Nome": t.name or "-",
+                                "IP OLT": t.host,
+                                "Porta": t.port,
+                                "Usuário": t.username,
+                                "Slot Filtrado": t.slot if t.slot is not None else "Todos",
+                                "Porta PON Filtrada": t.port_gpon if t.port_gpon is not None else "Todas",
+                            }
+                            for t in targets
+                        ]
                     )
+                    st.dataframe(target_df, use_container_width=True, hide_index=True)
 
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+                    if st.button("🚀 Iniciar Varredura de ONTs Offline", type="primary", use_container_width=True):
+                        _execute_scan_workflow(targets)
 
-                    def update_progress(msg: str):
-                        status_text.text(msg)
-
-                    candidates = coordinator.scan_all(targets, progress_callback=update_progress)
-                    st.session_state.candidates = candidates
-                    st.session_state.scan_errors = coordinator.scan_errors
-                    st.session_state.board_reports = coordinator.board_reports
-                    progress_bar.progress(100)
-                    status_text.text("Varredura concluída!")
-
-                    if coordinator.scan_errors:
-                        for err in coordinator.scan_errors:
-                            st.error(f"❌ {err}")
-                        st.warning(
-                            "💡 Consulte a aba **'4. Logs de Diagnóstico'** (ou o arquivo `logs/limpa_hw.log`) para ver o retorno detalhado do JumpServer/OLT."
-                        )
-
-                    if candidates:
-                        st.success(f"Varredura finalizada! **{len(candidates)} ONTs offline** encontradas.")
-                        st.info("Acesse a aba **'2. Revisar Clientes & Confirmar'** para verificar os logins e aprovar as deleções.")
-                    elif not coordinator.scan_errors:
-                        st.warning(
-                            "⚠️ A varredura terminou sem erros de conexão, mas **0 ONTs offline** atenderam aos critérios informados. "
-                            "Verifique a aba **'4. Logs de Diagnóstico'** para conferir os comandos executados na OLT."
-                        )
-
-        except Exception as e:
-            st.error(f"Erro ao processar a planilha: {e}")
+                except Exception as e:
+                    st.error(f"Erro ao processar a planilha: {e}")
 
     # Resumo das placas detectadas pelo 'display board 0' na última varredura
     if st.session_state.get("board_reports"):
@@ -450,33 +613,22 @@ with tab_scan:
                     hide_index=True,
                 )
 
-    elif is_demo:
-        st.warning("⚠️ Você ativou o Modo Demonstração (OLT Simulada). Você pode clicar abaixo para testar sem planilha real:")
-        if st.button("🧪 Executar Varredura com OLT de Teste"):
-            mock_target = OltTarget(
-                host="192.168.1.100",
-                port=22,
-                username="admin",
-                password="mock",
-                name="OLT Central (Simulada)",
-                slot=1,
-                port_gpon=0,
-            )
-            st.session_state.targets = [mock_target]
-            backup_mgr = BackupManager(cleanup_settings.backup_dir)
-            coordinator = MultiOltCoordinator(backup_mgr, cleanup_settings, is_demo=True)
-            candidates = coordinator.scan_all([mock_target])
-            st.session_state.candidates = candidates
-            st.success(f"Varredura simulada concluída! **{len(candidates)} ONTs offline** encontradas.")
-            st.info("Acesse a aba **'2. Revisar Clientes & Confirmar'** para prosseguir.")
-
 
 # ---------------- TAB 2: Revisar Clientes & Confirmar ----------------
 with tab_review:
     st.subheader("Conferência de Clientes / Logins e Seleção para Limpeza")
 
+    if st.session_state.get("last_cleanup_summary"):
+        summary_info = st.session_state.last_cleanup_summary
+        st.success(
+            f"✅ Última rotina concluída! **{summary_info['count']} ONT(s)** processada(s) e removida(s) da listagem pendente."
+        )
+        if summary_info.get("history_txt"):
+            st.info(f"📝 Registro obrigatório salvo em: `{summary_info['history_txt']}`")
+        st.info("Acesse a aba **'3. Relatório & Rollback'** para baixar o relatório em Excel ou fazer rollback individual.")
+
     if not st.session_state.candidates:
-        st.info("Nenhuma varredura realizada ainda. Importe a planilha e inicie a varredura na aba anterior.")
+        st.info("Nenhuma ONT pendente na listagem. Realize uma nova varredura na aba anterior se desejar.")
     else:
         candidates = st.session_state.candidates
         eval_cleaner = OntCleaner(client=None, backup_manager=None, settings=cleanup_settings)
@@ -645,7 +797,7 @@ with tab_review:
                     st.error("⚠️ MODO REAL ATIVADO: As ONTs selecionadas e seus service-ports serão excluídos da OLT!")
 
                 if st.button(btn_label, type=btn_type, use_container_width=True):
-                    backup_mgr = BackupManager(cleanup_settings.backup_dir)
+                    backup_mgr = BackupManager(cleanup_settings.backup_dir, history_dir=str(HISTORY_DIR_PATH))
                     coordinator = MultiOltCoordinator(
                         backup_manager=backup_mgr,
                         settings=cleanup_settings,
@@ -687,61 +839,49 @@ with tab_review:
                     )
                     st.session_state.session_rollback_path = session_rollback
 
-                    st.success(f"Rotina de limpeza concluída! {sum(1 for r in results if r.success)} ONTs processadas.")
-                    st.info("Acesse a aba **'3. Relatório & Rollback'** para baixar o relatório em Excel e os arquivos de Rollback.")
+                    # Registro obrigatório em .txt na pasta historico_exclusoes/
+                    history_txt = backup_mgr.save_deletion_history_txt(
+                        results, is_dry_run=cleanup_settings.dry_run
+                    )
+                    st.session_state.history_txt_path = history_txt
+
+                    # Remove imediatamente da listagem de revisão as ONTs já deletadas com sucesso
+                    deleted_keys = {
+                        (r.ont.olt_host, r.ont.location)
+                        for r in results
+                        if r.success and r.ont_deleted
+                    }
+                    st.session_state.candidates = [
+                        c
+                        for c in st.session_state.candidates
+                        if (c.ont.olt_host, c.ont.location) not in deleted_keys
+                    ]
+                    st.session_state.last_cleanup_summary = {
+                        "count": len(deleted_keys),
+                        "history_txt": history_txt,
+                    }
+                    st.rerun()
 
 
 # ---------------- TAB 3: Relatório & Rollback ----------------
 with tab_results:
     st.subheader("Relatório da Execução e Scripts de Rollback Individual")
 
-    if not st.session_state.results:
-        st.info("Nenhuma execução realizada até o momento.")
-    else:
-        results = st.session_state.results
-        success_count = sum(1 for r in results if r.success)
-        failed_count = len(results) - success_count
-
-        r_col1, r_col2 = st.columns([1, 1])
-        with r_col1:
-            if st.session_state.excel_report_path and os.path.exists(st.session_state.excel_report_path):
-                with open(st.session_state.excel_report_path, "rb") as f:
-                    st.download_button(
-                        label="📊 Baixar Relatório Completo em Excel (.xlsx)",
-                        data=f.read(),
-                        file_name=os.path.basename(st.session_state.excel_report_path),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-        with r_col2:
-            if st.session_state.session_rollback_path and os.path.exists(st.session_state.session_rollback_path):
-                with open(st.session_state.session_rollback_path, "rb") as f:
-                    st.download_button(
-                        label="📜 Baixar Script de Rollback da Sessão Completa (.txt)",
-                        data=f.read(),
-                        file_name=os.path.basename(st.session_state.session_rollback_path),
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
-
-        st.write("---")
-        st.write("### Equipamentos Processados e Opções de Rollback Individual:")
-
+    def _render_rollback_cards(card_results: list, key_prefix: str) -> None:
         targets_by_ip = {t.host: t for t in st.session_state.targets}
-
-        for idx_res, res in enumerate(results):
+        for idx_res, res in enumerate(card_results):
             ont = res.ont
-            rb_key = f"{ont.olt_host}_{ont.location}_{idx_res}"
+            rb_key = f"{key_prefix}_{ont.olt_host}_{ont.location}_{idx_res}"
             already_restored = st.session_state.rollback_status.get(rb_key, {}).get("ok", False)
             status_icon = "🔄 Reincluído" if already_restored else ("✅ Removido" if res.success else "❌ Falha")
 
             with st.expander(
-                f"{status_icon} | ONT {ont.location} | Cliente: {ont.customer_login or ont.description or '-'} | SN: {ont.sn}",
+                f"{status_icon} | ONT {ont.location} | Cliente: {ont.customer_login or ont.description or '-'} | SN: {ont.sn or '-'}",
                 expanded=True,
             ):
                 info_c1, info_c2 = st.columns([1, 1])
                 with info_c1:
-                    st.write(f"**OLT:** {ont.olt_name or '-'} (`{ont.olt_host}`)")
+                    st.write(f"**OLT:** {ont.olt_name or '-'} (`{ont.olt_host or '-'}`)")
                     st.write(f"**Localização GPON:** `{ont.location}`")
                     st.write(f"**Login / Descrição:** `{ont.customer_login or ont.description or '-'}`")
                 with info_c2:
@@ -773,6 +913,14 @@ with tab_results:
                                     key=f"dl_rb_{rb_key}",
                                     use_container_width=True,
                                 )
+                        else:
+                            st.download_button(
+                                label=f"📥 Baixar Script de Rollback ({ont.location})",
+                                data=("\n".join(res.rollback_commands) + "\n").encode("utf-8"),
+                                file_name=f"rollback_{ont.location.replace('/', '_').replace(':', '_')}.txt",
+                                key=f"dl_rb_{rb_key}",
+                                use_container_width=True,
+                            )
 
                     if exec_rb_clicked:
                         target_olt = targets_by_ip.get(ont.olt_host) or OltTarget(
@@ -782,7 +930,7 @@ with tab_results:
                             username=direct_user,
                             password=direct_pass,
                         )
-                        backup_mgr = BackupManager(cleanup_settings.backup_dir)
+                        backup_mgr = BackupManager(cleanup_settings.backup_dir, history_dir=str(HISTORY_DIR_PATH))
                         rb_coordinator = MultiOltCoordinator(
                             backup_manager=backup_mgr,
                             settings=cleanup_settings,
@@ -811,6 +959,128 @@ with tab_results:
                         else:
                             st.error(f"❌ Falha no Rollback da ONT {ont.location}:")
                         st.code(st_info["msg"], language="text")
+
+    if not st.session_state.results:
+        st.info("Nenhuma execução realizada nesta sessão. Você ainda pode importar um arquivo de histórico (.txt) abaixo para fazer rollback individual.")
+    else:
+        results = st.session_state.results
+
+        r_col1, r_col2, r_col3 = st.columns([1, 1, 1])
+        with r_col1:
+            if st.session_state.excel_report_path and os.path.exists(st.session_state.excel_report_path):
+                with open(st.session_state.excel_report_path, "rb") as f:
+                    st.download_button(
+                        label="📊 Baixar Relatório em Excel (.xlsx)",
+                        data=f.read(),
+                        file_name=os.path.basename(st.session_state.excel_report_path),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+        with r_col2:
+            if st.session_state.history_txt_path and os.path.exists(st.session_state.history_txt_path):
+                with open(st.session_state.history_txt_path, "rb") as f:
+                    st.download_button(
+                        label="📝 Baixar Registro de Exclusões (.txt)",
+                        data=f.read(),
+                        file_name=os.path.basename(st.session_state.history_txt_path),
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
+        with r_col3:
+            if st.session_state.session_rollback_path and os.path.exists(st.session_state.session_rollback_path):
+                with open(st.session_state.session_rollback_path, "rb") as f:
+                    st.download_button(
+                        label="📜 Baixar Rollback da Sessão (.txt)",
+                        data=f.read(),
+                        file_name=os.path.basename(st.session_state.session_rollback_path),
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
+
+        st.write("---")
+        st.write("### Equipamentos Processados nesta Sessão:")
+        _render_rollback_cards(results, key_prefix="sess")
+
+    # ---------- Seção de Importação de Histórico (.txt) para Rollback Individual ----------
+    st.write("---")
+    st.subheader("📂 Rollback Individual a partir de Registro de Exclusões (.txt)")
+    st.caption(
+        f"Todas as exclusões geram automaticamente um arquivo `.txt` com data e hora em `{HISTORY_DIR_PATH}`. "
+        "Importe qualquer arquivo `.txt` abaixo (ou selecione um salvo localmente) para reincluir ONTs individualmente."
+    )
+
+    hist_mgr = BackupManager(cleanup_settings.backup_dir, history_dir=str(HISTORY_DIR_PATH))
+    saved_history_files = hist_mgr.list_deletion_history_files()
+
+    h_col1, h_col2 = st.columns([1, 1])
+    with h_col1:
+        uploaded_hist_txt = st.file_uploader(
+            "Importar arquivo de registro (.txt)",
+            type=["txt"],
+            key="upload_history_txt",
+        )
+    with h_col2:
+        saved_options = ["-- Selecione um registro salvo --"] + [os.path.basename(p) for p in saved_history_files]
+        selected_saved_name = st.selectbox(
+            f"Ou escolha da pasta historico_exclusoes/ ({len(saved_history_files)} arquivo(s))",
+            options=saved_options,
+            index=0,
+        )
+
+    hist_content = ""
+    hist_source_label = ""
+    if uploaded_hist_txt is not None:
+        hist_content = uploaded_hist_txt.getvalue().decode("utf-8", errors="replace")
+        hist_source_label = uploaded_hist_txt.name
+    elif selected_saved_name != "-- Selecione um registro salvo --":
+        chosen_path = os.path.join(str(HISTORY_DIR_PATH), selected_saved_name)
+        if os.path.exists(chosen_path):
+            with open(chosen_path, "r", encoding="utf-8", errors="replace") as f:
+                hist_content = f.read()
+            hist_source_label = selected_saved_name
+
+    if hist_content:
+        hist_meta, hist_results = BackupManager.parse_deletion_history_txt(hist_content)
+        if not hist_results:
+            st.warning(
+                f"O arquivo `{hist_source_label}` não contém registros de ONTs no formato do LimpaHW."
+            )
+        else:
+            st.success(
+                f"Registro `{hist_source_label}` carregado: **{len(hist_results)} ONT(s)** "
+                f"| Data/Hora: **{hist_meta.get('DATA_HORA', '-')}** | Modo: **{hist_meta.get('MODO', '-')}**"
+            )
+            hist_search = st.text_input(
+                "🔎 Filtrar ONTs do registro (Login / SN / OLT / Localização)",
+                value="",
+                placeholder="ex: joao.silva, 0/1/0:1, 4857...",
+                key="hist_search_input",
+            ).strip().lower()
+
+            if hist_search:
+                hist_filtered = [
+                    r
+                    for r in hist_results
+                    if hist_search
+                    in " ".join(
+                        [
+                            r.ont.olt_name or "",
+                            r.ont.olt_host or "",
+                            r.ont.location,
+                            r.ont.customer_login or "",
+                            r.ont.description or "",
+                            r.ont.sn or "",
+                            r.ont.mac or "",
+                        ]
+                    ).lower()
+                ]
+            else:
+                hist_filtered = hist_results
+
+            if not hist_filtered:
+                st.warning("Nenhuma ONT corresponde à busca informada.")
+            else:
+                _render_rollback_cards(hist_filtered, key_prefix=f"hist_{hist_source_label}")
 
 
 # ---------------- TAB 4: Logs de Diagnóstico ----------------
